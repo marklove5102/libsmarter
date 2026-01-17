@@ -1,4 +1,4 @@
-project('libsmarter', 'cpp')
+project('libsmarter')
 
 incl = include_directories('include/')
 
