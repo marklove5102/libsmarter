@@ -30,37 +30,24 @@ struct adopt_rc_t { };
 //inline constexpr adopt_rc_t adopt_rc;
 static constexpr adopt_rc_t adopt_rc;
 
-// Each counter has a 'holder'. The holder is either null or
-// another counter that controls the lifetime of the counter itself.
 struct counter {
 public:
 	counter()
-	: _holder{nullptr}, _count{0} { }
+	: _count{0} { }
 
-	// TODO: Do not take a pointer to a counter but a shared_ptr here.
-	counter(adopt_rc_t, counter *holder, unsigned int initial_count)
-	: _holder{holder}, _count{initial_count} { }
+	counter(adopt_rc_t, unsigned int initial_count)
+	: _count{initial_count} { }
 
 	counter(const counter &) = delete;
 
 	counter &operator= (const counter &) = delete;
 
-protected:
 	~counter() {
 		assert(!_count.load(std::memory_order_relaxed));
 	}
-
-	virtual void dispose() = 0;
-
-public:
-	void setup(adopt_rc_t, counter *holder, unsigned int initial_count) {
+	void setup(adopt_rc_t, unsigned int initial_count) {
 		assert(!_count.load(std::memory_order_relaxed));
-		_holder = holder;
 		_count.store(initial_count, std::memory_order_relaxed);
-	}
-
-	counter *holder() {
-		return _holder;
 	}
 
 	unsigned int check_count() {
@@ -72,7 +59,7 @@ public:
 		assert(count);
 	}
 
-	bool increment_if_nonzero() {
+	[[nodiscard]] bool increment_if_nonzero() {
 		auto count = _count.load(std::memory_order_relaxed);
 		do {
 			if(!count)
@@ -82,46 +69,15 @@ public:
 		return true;
 	}
 
-	void decrement() {
+	[[nodiscard]] bool decrement_and_check_if_zero() {
 		auto count = _count.fetch_sub(1, std::memory_order_acq_rel);
-		if(count > 1)
-			return;
-		assert(count == 1);
-
-		// dispose() is allowed to destruct the counter itself;
-		// therefore we load _holder before calling it.
-		auto h = _holder;
-
-		dispose();
-
-		// We expect that this recursion is too shallow to be a problem.
-		if(h)
-			h->decrement();
+		assert(count >= 1);
+		return count == 1;
 	}
 
 private:
-	counter *_holder;
 	std::atomic<unsigned int> _count;
 };
-
-template<typename D, typename A = void>
-struct crtp_counter : counter {
-	crtp_counter() = default;
-
-	crtp_counter(adopt_rc_t, counter *holder, unsigned int initial_count)
-	: counter{adopt_rc, holder, initial_count} { }
-
-	void dispose() override {
-		auto d = static_cast<D *>(this);
-		d->dispose(A{});
-	}
-
-protected:
-	~crtp_counter() = default;
-};
-
-struct dispose_memory { };
-struct dispose_object { };
 
 struct default_deallocator {
 	template<typename X>
@@ -146,20 +102,31 @@ private:
 	A allocator_;
 };
 
+struct meta_object_base {
+	meta_object_base(void (*finalize)(meta_object_base *),
+			void (*finalize_weak)(meta_object_base *))
+	: _finalize{finalize}, _finalize_weak{finalize_weak} { }
+
+	counter &ctr() { return _ctr; }
+	counter &weak_ctr() { return _weak_ctr; }
+	void finalize() { _finalize(this); }
+	void finalize_weak() { _finalize_weak(this); }
+
+private:
+	counter _ctr;
+	counter _weak_ctr;
+	void (*_finalize)(meta_object_base *);
+	void (*_finalize_weak)(meta_object_base *);
+};
+
 template<typename T, typename Deallocator>
 struct meta_object final
-: private crtp_counter<meta_object<T, Deallocator>, dispose_memory>,
-		private crtp_counter<meta_object<T, Deallocator>, dispose_object> {
-	friend struct crtp_counter<meta_object, dispose_memory>;
-	friend struct crtp_counter<meta_object, dispose_object>;
-
+: meta_object_base {
 	template<typename... Args>
 	meta_object(unsigned int initial_count, Deallocator d, Args &&... args)
-	: crtp_counter<meta_object, dispose_memory>{adopt_rc, nullptr, 1},
-			crtp_counter<meta_object, dispose_object>{adopt_rc,
-				static_cast<crtp_counter<meta_object, dispose_memory> *>(this),
-				initial_count},
-			_d{std::move(d)} {
+	: meta_object_base{&finalize_, &finalize_weak_}, _d{std::move(d)} {
+		ctr().setup(adopt_rc, initial_count);
+		weak_ctr().setup(adopt_rc, 1);
 		_bx.initialize(std::forward<Args>(args)...);
 	}
 
@@ -168,33 +135,92 @@ struct meta_object final
 	T *get() {
 		return _bx.get();
 	}
-	
-	counter *memory_ctr() {
-		return static_cast<crtp_counter<meta_object, dispose_memory> *>(this);
-	}
-	
-	counter *object_ctr() {
-		return static_cast<crtp_counter<meta_object, dispose_object> *>(this);
-	}
 
 private:
-	// Suppress Clang's warning about hidden virtual functions.
-	using crtp_counter<meta_object, dispose_object>::dispose;
-	using crtp_counter<meta_object, dispose_memory>::dispose;
-
-	void dispose(dispose_object) {
-		_bx.destruct();
+	static void finalize_(meta_object_base *base) {
+		auto self = static_cast<meta_object *>(base);
+		self->_bx.destruct();
+		if(base->weak_ctr().decrement_and_check_if_zero())
+			base->finalize_weak();
 	}
 
-	void dispose(dispose_memory) {
-		_d(this);
+	static void finalize_weak_(meta_object_base *base) {
+		auto self = static_cast<meta_object *>(base);
+		self->_d(self);
 	}
 
 	frg::manual_box<T> _bx;
 	Deallocator _d;
 };
 
-template<typename T, typename D>
+template<typename P>
+concept rc_policy = requires(const P &policy) {
+	// Check whether the policy corresponds to a non-null object.
+	{ static_cast<bool>(policy) };
+	// Increment the refcount.
+	// Precondition: the refcount is already non-zero.
+	{ policy.increment() } -> std::same_as<void>;
+	// Decrements the refcount.
+	// Destructs (or otherwise performs finalization) the object if the refcount drops to zero.
+	{ policy.decrement() } -> std::same_as<void>;
+};
+
+// Superset of rc_policy that also supports weak pointers.
+template<typename P>
+concept weak_rc_policy = rc_policy<P> && requires(const P &policy) {
+	// Try to increment the refcount (not the weak refcount!).
+	// Returns true if the refcount was already non-zero.
+	{ policy.try_increment() } -> std::same_as<bool>;
+	// Increment the weak refcount.
+	// Precondition: the weak refcount is already non-zero.
+	{ policy.increment_weak() } -> std::same_as<void>;
+	// Decrements the weak refcount.
+	// Deallocates (or otherwise performs weak finalization) the object if the weak refcount drops to zero.
+	{ policy.decrement_weak() } -> std::same_as<void>;
+};
+
+struct default_rc_policy {
+	default_rc_policy() = default;
+
+	explicit default_rc_policy(meta_object_base *base)
+	: _base{base} { }
+
+	explicit operator bool() const {
+		return _base != nullptr;
+	}
+
+	void increment() const {
+		_base->ctr().increment();
+	}
+
+	void decrement() const {
+		if(_base->ctr().decrement_and_check_if_zero())
+			_base->finalize();
+	}
+
+	bool try_increment() const {
+		return _base->ctr().increment_if_nonzero();
+	}
+
+	void increment_weak() const {
+		_base->weak_ctr().increment();
+	}
+
+	void decrement_weak() const {
+		if(_base->weak_ctr().decrement_and_check_if_zero())
+			_base->finalize_weak();
+	}
+
+	meta_object_base *base() const {
+		return _base;
+	}
+
+private:
+	meta_object_base *_base{nullptr};
+};
+static_assert(weak_rc_policy<default_rc_policy>);
+
+template<typename T, rc_policy P>
 struct shared_ptr;
 
 template<typename T, typename D>
@@ -212,42 +238,34 @@ struct ptr_access_crtp {
 
 template<typename D>
 struct ptr_access_crtp<void, D> {
-	
+
 };
 
-template<typename T, typename H = void>
-struct shared_ptr : ptr_access_crtp<T, shared_ptr<T, H>> {
-	template<typename T_, typename H_>
+template<typename T, rc_policy P = default_rc_policy>
+struct shared_ptr : ptr_access_crtp<T, shared_ptr<T, P>> {
+	template<typename T_, rc_policy P_>
 	friend struct shared_ptr;
-	
+
 	friend struct ptr_access_crtp<T, shared_ptr>;
 
 	friend void swap(shared_ptr &x, shared_ptr &y) {
 		std::swap(x._object, y._object);
-		std::swap(x._ctr, y._ctr);
-	}
-
-	template<typename L>
-	friend shared_ptr handle_cast(shared_ptr<T, L> other) {
-		shared_ptr p;
-		std::swap(p._object, other._object);
-		std::swap(p._ctr, other._ctr);
-		return std::move(p);
+		std::swap(x._policy, y._policy);
 	}
 
 	shared_ptr()
-	: _object{nullptr}, _ctr{nullptr} { }
+	: _object{nullptr}, _policy{} { }
 
 	shared_ptr(std::nullptr_t)
-	: _object{nullptr}, _ctr{nullptr} { }
+	: _object{nullptr}, _policy{} { }
 
-	shared_ptr(adopt_rc_t, T *object, counter *ctr)
-	: _object{object}, _ctr{ctr} { }
+	shared_ptr(adopt_rc_t, T *object, P policy)
+	: _object{object}, _policy{std::move(policy)} { }
 
 	shared_ptr(const shared_ptr &other)
-	: _object{other._object}, _ctr{other._ctr} {
-		if(_ctr)
-			_ctr->increment();
+	: _object{other._object}, _policy{other._policy} {
+		if(_policy)
+			_policy.increment();
 	}
 
 	shared_ptr(shared_ptr &&other)
@@ -255,22 +273,23 @@ struct shared_ptr : ptr_access_crtp<T, shared_ptr<T, H>> {
 		swap(*this, other);
 	}
 
-	template<typename X>//, typename = std::enable_if_t<std::is_base_of_v<X, T>>>
-	shared_ptr(shared_ptr<X, H> other)
+	template<typename X>
+	shared_ptr(shared_ptr<X, P> other)
+	requires std::convertible_to<X *, T *>
 	: _object{std::exchange(other._object, nullptr)},
-			_ctr{std::exchange(other._ctr, nullptr)} { }
+			_policy{std::exchange(other._policy, P{})} { }
 
 	// Aliasing constructor.
 	template<typename X>
-	shared_ptr(const shared_ptr<X, H> &other, T *object)
-	: _object{object}, _ctr{other._ctr} {
-		if(_ctr)
-			_ctr->increment();
+	shared_ptr(const shared_ptr<X, P> &other, T *object)
+	: _object{object}, _policy{other._policy} {
+		if(_policy)
+			_policy.increment();
 	}
 
 	~shared_ptr() {
-		if(_ctr)
-			_ctr->decrement();
+		if(_policy)
+			_policy.decrement();
 	}
 
 	shared_ptr &operator= (shared_ptr other) {
@@ -283,14 +302,14 @@ struct shared_ptr : ptr_access_crtp<T, shared_ptr<T, H>> {
 	}
 
 #if LIBSMARTER_HOSTED
-	std::pair<T *, counter *> release() {
+	std::pair<T *, P> release() {
 		return std::make_pair(std::exchange(_object, nullptr),
-				std::exchange(_ctr, nullptr));
+				std::exchange(_policy, P{}));
 	}
 #else
 	void release() {
 		_object = nullptr;
-		_ctr = nullptr;
+		_policy = P{};
 	}
 #endif
 
@@ -298,104 +317,104 @@ struct shared_ptr : ptr_access_crtp<T, shared_ptr<T, H>> {
 		return _object;
 	}
 
-	counter *ctr() const {
-		return _ctr;
+	const P &policy() const {
+		return _policy;
 	}
 
 private:
 	T *_object;
-	counter *_ctr;
+	P _policy;
 };
 
-template<typename X, typename T, typename H>
-shared_ptr<X, H> static_pointer_cast(shared_ptr<T, H> other) {
-	auto ptr = shared_ptr<X, H>{adopt_rc, static_cast<X *>(other.get()), other.ctr()};
+template<typename X, typename T, rc_policy P>
+shared_ptr<X, P> static_pointer_cast(shared_ptr<T, P> other) {
+	auto ptr = shared_ptr<X, P>{adopt_rc, static_cast<X *>(other.get()), other.policy()};
 	other.release();
 	return std::move(ptr);
 }
 
-template<typename T, typename H = void>
-struct borrowed_ptr : ptr_access_crtp<T, borrowed_ptr<T, H>> {
-	template<typename T_, typename H_>
+template<typename T, rc_policy P = default_rc_policy>
+struct borrowed_ptr : ptr_access_crtp<T, borrowed_ptr<T, P>> {
+	template<typename T_, rc_policy P_>
 	friend struct borrowed_ptr;
 
 	borrowed_ptr()
-	: _object{nullptr}, _ctr{nullptr} { }
+	: _object{nullptr}, _policy{} { }
 
 	borrowed_ptr(std::nullptr_t)
-	: _object{nullptr}, _ctr{nullptr} { }
+	: _object{nullptr}, _policy{} { }
 
-	borrowed_ptr(T *object, counter *ctr)
-	: _object{object}, _ctr{ctr} { }
+	borrowed_ptr(T *object, P policy)
+	: _object{object}, _policy{std::move(policy)} { }
 
-	template<typename X>//, typename = std::enable_if_t<std::is_base_of_v<X, T>>>
-	borrowed_ptr(borrowed_ptr<X, H> other)
-	: _object{other._object}, _ctr{other._ctr} { }
+	template<typename X>
+	requires std::convertible_to<X *, T *>
+	borrowed_ptr(borrowed_ptr<X, P> other)
+	: _object{other._object}, _policy{other._policy} { }
 
 	// Construction from shared_ptr.
-	// TODO: enable_if X * is convertible to T *.
 	template<typename X>
-	borrowed_ptr(const shared_ptr<X, H> &other)
-	: _object{other.get()}, _ctr{other.ctr()} { }
+	requires std::convertible_to<X *, T *>
+	borrowed_ptr(const shared_ptr<X, P> &other)
+	: _object{other.get()}, _policy{other.policy()} { }
 
 	T *get() const {
 		return _object;
 	}
 
-	counter *ctr() const {
-		return _ctr;
+	const P &policy() const {
+		return _policy;
 	}
 
 	explicit operator bool () const {
 		return _object;
 	}
 
-	shared_ptr<T, H> lock() const {
-		if(!_ctr)
-			return shared_ptr<T, H>{};
-		_ctr->increment();
-		return shared_ptr<T, H>{adopt_rc, _object, _ctr};
+	shared_ptr<T, P> lock() const {
+		if(!_policy)
+			return shared_ptr<T, P>{};
+		_policy.increment();
+		return shared_ptr<T, P>{adopt_rc, _object, _policy};
 	}
 
 private:
 	T *_object;
-	counter *_ctr;
+	P _policy;
 };
 
-template<typename X, typename T, typename H>
-borrowed_ptr<X, H> static_pointer_cast(borrowed_ptr<T, H> other) {
-	return borrowed_ptr<X, H>{static_cast<X *>(other.get()), other.ctr()};
+template<typename X, typename T, rc_policy P>
+borrowed_ptr<X, P> static_pointer_cast(borrowed_ptr<T, P> other) {
+	return borrowed_ptr<X, P>{static_cast<X *>(other.get()), other.policy()};
 }
 
-template<typename T, typename H = void>
+template<typename T, weak_rc_policy P = default_rc_policy>
 struct weak_ptr {
 	friend void swap(weak_ptr &x, weak_ptr &y) {
 		std::swap(x._object, y._object);
-		std::swap(x._ctr, y._ctr);
+		std::swap(x._policy, y._policy);
 	}
 
 	weak_ptr()
-	: _object{nullptr}, _ctr{nullptr} { }
+	: _object{nullptr}, _policy{} { }
 
-	weak_ptr(const shared_ptr<T, H> &ptr)
-	: _object{ptr.get()}, _ctr{ptr.ctr()} {
-		assert(_ctr->holder());
-		_ctr->holder()->increment();
+	weak_ptr(const shared_ptr<T, P> &ptr)
+	: _object{ptr.get()}, _policy{ptr.policy()} {
+		if (_policy)
+			_policy.increment_weak();
 	}
 
 	template<typename X>
-	weak_ptr(const shared_ptr<X, H> &ptr)
-	: _object{ptr.get()}, _ctr{ptr.ctr()} {
-		assert(_ctr->holder());
-		_ctr->holder()->increment();
+	weak_ptr(const shared_ptr<X, P> &ptr)
+	requires std::convertible_to<X *, T *>
+	: _object{ptr.get()}, _policy{ptr.policy()} {
+		if (_policy)
+			_policy.increment_weak();
 	}
 
 	weak_ptr(const weak_ptr &other)
-	: _object{other._object}, _ctr{other._ctr} {
-		if(_ctr) {
-			assert(_ctr->holder());
-			_ctr->holder()->increment();
-		}
+	: _object{other._object}, _policy{other._policy} {
+		if(_policy)
+			_policy.increment_weak();
 	}
 
 	weak_ptr(weak_ptr &&other)
@@ -404,10 +423,8 @@ struct weak_ptr {
 	}
 
 	~weak_ptr() {
-		if(_ctr) {
-			assert(_ctr->holder());
-			_ctr->holder()->decrement();
-		}
+		if(_policy)
+			_policy.decrement_weak();
 	}
 
 	weak_ptr &operator= (weak_ptr other) {
@@ -415,26 +432,30 @@ struct weak_ptr {
 		return *this;
 	}
 
-	shared_ptr<T, H> lock() const {
-		if(!_ctr)
-			return shared_ptr<T, H>{};
+	const P &policy() const {
+		return _policy;
+	}
 
-		if(!_ctr->increment_if_nonzero())
-			return shared_ptr<T, H>{};
-		
-		return shared_ptr<T, H>{adopt_rc, _object, _ctr};
+	shared_ptr<T, P> lock() const {
+		if(!_policy)
+			return shared_ptr<T, P>{};
+
+		if(!_policy.try_increment())
+			return shared_ptr<T, P>{};
+
+		return shared_ptr<T, P>{adopt_rc, _object, _policy};
 	}
 
 private:
 	T *_object;
-	counter *_ctr;
+	P _policy;
 };
 
 template<typename T, typename... Args>
 shared_ptr<T> make_shared(Args &&... args) {
 	auto meta = new meta_object<T, default_deallocator>{1,
 			default_deallocator{}, std::forward<Args>(args)...};
-	return shared_ptr<T>{adopt_rc, meta->get(), meta->object_ctr()};
+	return shared_ptr<T>{adopt_rc, meta->get(), default_rc_policy{meta}};
 }
 
 template<typename T, typename Allocator, typename... Args>
@@ -443,7 +464,7 @@ shared_ptr<T> allocate_shared(Allocator alloc, Args &&... args) {
 	auto memory = alloc.allocate(sizeof(meta_type));
 	auto meta = new (memory) meta_type{1,
 			allocator_deallocator<Allocator>{alloc}, std::forward<Args>(args)...};
-	return shared_ptr<T>{adopt_rc, meta->get(), meta->object_ctr()};
+	return shared_ptr<T>{adopt_rc, meta->get(), default_rc_policy{meta}};
 }
 
 } // namespace smarter
