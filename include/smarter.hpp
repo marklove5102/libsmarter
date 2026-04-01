@@ -179,6 +179,18 @@ concept weak_rc_policy = rc_policy<P> && requires(const P &policy) {
 	{ policy.decrement_weak() } -> std::same_as<void>;
 };
 
+template<typename C>
+struct rc_policy_tag { };
+
+template<typename P, typename C>
+concept rc_policy_downcastable = rc_policy<P> && rc_policy<C> && requires(const P &policy) {
+	// Converts a policy to another policy.
+	// Does not change the refcount associated with either policy.
+	// Invariant: if the refcount of P is non-zero, the refcount of downcast_policy() must also be non-zero
+	//            (such that increment() can be called on the result of downcast_policy()).
+	{ policy.downcast_policy(rc_policy_tag<C>{}) } -> std::same_as<C>;
+};
+
 struct default_rc_policy {
 	default_rc_policy() = default;
 
@@ -331,6 +343,14 @@ shared_ptr<X, P> static_pointer_cast(shared_ptr<T, P> other) {
 	auto ptr = shared_ptr<X, P>{adopt_rc, static_cast<X *>(other.get()), other.policy()};
 	other.release();
 	return std::move(ptr);
+}
+
+template<rc_policy C, typename T, rc_policy P>
+requires rc_policy_downcastable<P, C>
+shared_ptr<T, C> rc_policy_downcast(const shared_ptr<T, P> &other) {
+	auto new_policy = other.policy().downcast_policy(rc_policy_tag<C>{});
+	new_policy.increment();
+	return shared_ptr<T, C>{adopt_rc, other.get(), new_policy};
 }
 
 template<typename T, rc_policy P = default_rc_policy>
